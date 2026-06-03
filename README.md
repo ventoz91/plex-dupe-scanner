@@ -84,6 +84,23 @@ python plex_dupe_scan.py -c /path/to/my-config.json
 
 SSH authentication tries your SSH agent / keys first. If that fails, you will be prompted for a password.
 
+### Applying a script remotely
+
+Instead of copying a script to the server, you can run it remotely once you have reviewed it:
+
+1. Open the generated `.sh` file in any text editor.
+2. Remove any lines you do not want to execute.
+3. Change `HasBeenChecked=false` to `HasBeenChecked=true`.
+4. Run:
+
+```bash
+python plex_dupe_scan.py --apply reports/plex_purge_candidates_<timestamp>.sh
+```
+
+The script will SSH into the server, execute the cleanup, and print a summary showing targets processed, files/directories removed, space freed, and which directories were affected. Any errors from the server are printed at the end.
+
+> The `--apply` command strips the interactive `-I` flag from `rm` commands automatically, since you have already reviewed the file. It also runs all commands even if one fails, collecting all errors rather than stopping at the first.
+
 ## Output
 
 All output files are written to `output_dir` (default: `./reports`).
@@ -113,12 +130,16 @@ mv -v -- '/path/to/orphan' '/path/to/staging/'
 # rm -rf -- '/path/to/orphan'
 ```
 
-### Running the scripts
+### Running the scripts manually
 
-Copy the `.sh` file to your Plex server and run it there, or paste its contents into an active SSH session:
+As an alternative to `--apply`, you can copy a script to your Plex server and run it there:
 
 ```bash
 scp reports/plex_purge_candidates_<timestamp>.sh admin@192.168.1.100:~/
 ssh admin@192.168.1.100
 bash ~/plex_purge_candidates_<timestamp>.sh
 ```
+
+### Report retention
+
+Each scan keeps the **5 most recent** report/script pairs per type and deletes older ones automatically. Change the `keep` value in `prune_old_reports()` in `plex_dupe_scan.py` if you want to retain more.
