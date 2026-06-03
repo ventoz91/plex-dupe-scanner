@@ -837,7 +837,7 @@ def write_torrent_report(
 
             for t in sorted(true_orphans, key=lambda x: x["path"]):
                 report.write(f"| {human_size(t['size'])} | `{t['path']}` |\n")
-                rm_flag = "-rf" if t["is_dir"] else "-f"
+                rm_flag = "-rfv" if t["is_dir"] else "-fv"
                 script.write(f"mv -v -- {shell_quote(t['path'])} {shell_quote(move_dest)}\n")
                 script.write(f"# rm {rm_flag} -- {shell_quote(t['path'])}\n\n")
 
