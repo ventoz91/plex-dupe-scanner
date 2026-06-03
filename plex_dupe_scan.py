@@ -263,7 +263,7 @@ def normalize_title(filename: str) -> str:
     for pat in _QUALITY_JUNK:
         name = re.sub(pat, " ", name, flags=re.IGNORECASE)
 
-    name = re.sub(r"[\._\-\[\]\(\)]", " ", name)
+    name = re.sub(r"[\._\-\[\]\(\),]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
 
     return name
@@ -277,7 +277,7 @@ def normalize_for_torrent_match(name: str) -> str:
     for pat in _QUALITY_JUNK + _TORRENT_JUNK:
         name = re.sub(pat, " ", name, flags=re.IGNORECASE)
 
-    name = re.sub(r"[\._\-\[\]\(\)]", " ", name)
+    name = re.sub(r"[\._\-\[\]\(\),]", " ", name)
     name = re.sub(r"\s+", " ", name).strip()
 
     return name
@@ -290,13 +290,17 @@ def extract_base_title(name: str) -> str:
     """
     name = _clean_torrent_name(name)
     name = _strip_apostrophes(name)
-    name = re.sub(r"[\._\-\[\]\(\)]", " ", name)
+    name = re.sub(r"[\._\-\[\]\(\),]", " ", name)
     name = re.sub(r"\s+", " ", name).strip().lower()
 
     m = _TITLE_BOUNDARY.search(name)
     title = name[:m.start()].strip() if m else name
     # Strip trailing bare episode number left by anime "- 24" style naming
-    return re.sub(r"\s+\d{1,3}\s*$", "", title).strip()
+    title = re.sub(r"\s+\d{1,3}\s*$", "", title).strip()
+    # Strip trailing country/region disambiguator added by Plex or release groups
+    # e.g. "Ghosts (US)" → "ghosts us" → "ghosts", "The Traitors (US)" → "the traitors"
+    title = re.sub(r"\s+\b(?:us|uk|au|nz|ca)\b$", "", title)
+    return title
 
 
 # ── Season / episode extraction ───────────────────────────────────────────────
