@@ -180,6 +180,67 @@ def run_remote_torrent_scan(client: paramiko.SSHClient, config: dict) -> list[di
     return json.loads(output) if output.strip() else []
 
 
+def run_remote_junk_scan(client: paramiko.SSHClient, config: dict) -> list[dict]:
+    """
+    Walk media_paths on the remote host and return every file that is NOT a
+    plain media or subtitle file — i.e. candidates for junk cleanup.
+
+    Also returns video files that are in an extras directory or have "sample"
+    in their name, since those need separate handling.
+
+    Each entry: {path, name, size, is_video, in_extras, is_sample}
+    """
+    payload = json.dumps({
+        "media_paths": config["media_paths"],
+        "extensions": config["extensions"],
+    })
+
+    # _EXTRAS_DIRS serialised as a Python set literal inside the one-liner
+    extras_set = repr(_EXTRAS_DIRS)
+
+    command = "python3 -c " + shlex.quote(
+        "import json,os,sys,re\n"
+        "cfg=json.loads(sys.stdin.read())\n"
+        "media_paths=cfg['media_paths']\n"
+        "video_exts=set(e.lower() for e in cfg['extensions'])\n"
+        "sub_exts={'.srt','.sub','.idx','.ass','.ssa','.vtt','.sup','.smi','.sbv'}\n"
+        f"extras_dirs={extras_set}\n"
+        "def in_ex(path):\n"
+        "    parts=[p.strip().lower() for p in path.replace(os.sep,'/').split('/')]\n"
+        "    return any(p in extras_dirs for p in parts)\n"
+        "results=[]\n"
+        "for rp in media_paths:\n"
+        "    for root,dirs,files in os.walk(rp):\n"
+        "        for name in files:\n"
+        "            ext=os.path.splitext(name)[1].lower()\n"
+        "            is_vid=ext in video_exts\n"
+        "            is_sub=ext in sub_exts\n"
+        "            fp=os.path.join(root,name)\n"
+        "            is_ex=in_ex(fp)\n"
+        "            is_samp=bool(re.search(r'\\bsample\\b',name,re.IGNORECASE))\n"
+        "            if (is_vid and not is_ex and not is_samp) or (is_sub and not is_ex):\n"
+        "                continue\n"
+        "            try:stat=os.stat(fp)\n"
+        "            except OSError:continue\n"
+        "            results.append({'path':fp,'name':name,'size':stat.st_size,"
+        "'is_video':is_vid,'in_extras':is_ex,'is_sample':is_samp})\n"
+        "print(json.dumps(results))\n"
+    )
+
+    stdin, stdout, stderr = client.exec_command(command, timeout=None)
+    stdin.write(payload)
+    stdin.channel.shutdown_write()
+
+    output = stdout.read().decode("utf-8", errors="replace")
+    error = stderr.read().decode("utf-8", errors="replace")
+    exit_code = stdout.channel.recv_exit_status()
+
+    if exit_code != 0:
+        raise RuntimeError(f"Remote junk scan failed:\n{error}")
+
+    return json.loads(output) if output.strip() else []
+
+
 # ── Title normalisation ───────────────────────────────────────────────────────
 
 _QUALITY_JUNK = [
@@ -222,6 +283,27 @@ _TITLE_BOUNDARY = re.compile(
 
 _MEDIA_EXTS = frozenset({
     ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".ts", ".iso", ".m2ts",
+})
+
+_SUBTITLE_EXTS = frozenset({
+    ".srt", ".sub", ".idx", ".ass", ".ssa", ".vtt", ".sup", ".smi", ".sbv",
+})
+
+# Plex-recognised local media asset filenames (stem only, lower-case).
+# Files whose stem matches one of these (or ends in "-<stem>") are kept when
+# keep_local_artwork is true.
+_PLEX_ARTWORK_STEMS = frozenset({
+    "folder", "poster", "backdrop", "fanart", "thumb", "banner",
+    "clearart", "clearlogo", "landscape", "keyart",
+})
+
+_ARTWORK_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+# Directory names that Plex uses for extras (case-insensitive match).
+_EXTRAS_DIRS = frozenset({
+    "behind the scenes", "deleted scenes", "featurettes", "interviews",
+    "scenes", "shorts", "trailers", "extras", "bts", "bonus",
+    "bonus features", "special features", "specials",
 })
 
 
@@ -528,6 +610,52 @@ def classify_torrents(
     return matched, has_alternate, true_orphans
 
 
+# ── Junk classification ───────────────────────────────────────────────────────
+
+def _is_plex_artwork(name: str) -> bool:
+    stem, ext = os.path.splitext(name.lower())
+    if ext not in _ARTWORK_EXTS:
+        return False
+    if stem in _PLEX_ARTWORK_STEMS:
+        return True
+    for suffix in _PLEX_ARTWORK_STEMS:
+        if stem.endswith(f"-{suffix}"):
+            return True
+    return False
+
+
+def classify_junk_files(
+    files: list[dict],
+    config: dict,
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Sort the output of run_remote_junk_scan into three buckets.
+
+    Returns (junk, samples, extras):
+      junk    – non-video, non-subtitle files (.nfo, .sfv, stray images, etc.)
+      samples – video files with 'sample' in the name
+      extras  – any file inside a recognised Plex extras directory
+    """
+    keep_artwork = config.get("keep_local_artwork", True)
+
+    junk: list[dict] = []
+    samples: list[dict] = []
+    extras: list[dict] = []
+
+    for f in files:
+        if f["in_extras"]:
+            extras.append(f)
+            continue
+        if f["is_sample"]:
+            samples.append(f)
+            continue
+        if keep_artwork and _is_plex_artwork(f["name"]):
+            continue
+        junk.append(f)
+
+    return junk, samples, extras
+
+
 # ── Formatting helpers ────────────────────────────────────────────────────────
 
 def human_size(size: int) -> str:
@@ -719,12 +847,96 @@ def write_torrent_report(
     return report_path, script_path
 
 
+def write_junk_report(
+    config: dict,
+    junk_files: list[dict],
+    sample_files: list[dict],
+    extras_files: list[dict],
+) -> tuple[Path, Path]:
+    output_dir = Path(config.get("output_dir", "./reports"))
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    report_path = output_dir / f"plex_junk_report_{stamp}.md"
+    script_path = output_dir / f"plex_junk_candidates_{stamp}.sh"
+
+    all_files = junk_files + sample_files + extras_files
+    targets_meta = [{"path": f["path"], "size": f["size"], "is_dir": False} for f in all_files]
+
+    total_junk = sum(f["size"] for f in junk_files)
+    total_samples = sum(f["size"] for f in sample_files)
+    total_extras = sum(f["size"] for f in extras_files)
+    total_all = total_junk + total_samples + total_extras
+
+    with open(report_path, "w", encoding="utf-8") as report, \
+         open(script_path, "w", encoding="utf-8") as script:
+
+        report.write("# Plex Junk File Report\n\n")
+        report.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n\n")
+        report.write(f"- Junk files (.nfo, .sfv, etc.): **{len(junk_files)}** ({human_size(total_junk)})\n")
+        report.write(f"- Sample video files: **{len(sample_files)}** ({human_size(total_samples)})\n")
+        report.write(f"- Extras/bonus content: **{len(extras_files)}** ({human_size(total_extras)})\n\n")
+
+        script.write(_script_header(targets_meta))
+
+        if junk_files:
+            report.write("## Junk Files\n\n")
+            report.write("Non-media files in your media directories — `.nfo`, `.sfv`, stray images, etc.\n\n")
+            report.write("| Size | File |\n|---:|---|\n")
+
+            script.write("# ── Junk files (.nfo, .sfv, stray images, etc.) ─────────────────\n\n")
+
+            for f in sorted(junk_files, key=lambda x: x["path"]):
+                report.write(f"| {human_size(f['size'])} | `{f['path']}` |\n")
+                script.write(f"rm -Iv -- {shell_quote(f['path'])}\n")
+
+            report.write("\n")
+
+        if sample_files:
+            report.write("## Sample Files\n\n")
+            report.write("Video files with `sample` in the name — preview clips bundled with torrent releases.\n\n")
+            report.write("| Size | File |\n|---:|---|\n")
+
+            script.write("\n# ── Sample video files ────────────────────────────────────────────\n\n")
+
+            for f in sorted(sample_files, key=lambda x: x["path"]):
+                report.write(f"| {human_size(f['size'])} | `{f['path']}` |\n")
+                script.write(f"rm -Iv -- {shell_quote(f['path'])}\n")
+
+            report.write("\n")
+
+        if extras_files:
+            report.write("## Extras & Bonus Content\n\n")
+            report.write(
+                "Files inside Plex extras directories (Featurettes, Behind the Scenes, etc.). "
+                "**Plex Pass** users can browse these in the Extras tab — "
+                "only delete if you do not need them.\n\n"
+            )
+            report.write("| Size | File |\n|---:|---|\n")
+
+            script.write("\n# ── Extras / bonus content ────────────────────────────────────────\n")
+            script.write("# Plex Pass users can browse these; delete only if you don't need them.\n\n")
+
+            for f in sorted(extras_files, key=lambda x: x["path"]):
+                report.write(f"| {human_size(f['size'])} | `{f['path']}` |\n")
+                script.write(f"rm -Iv -- {shell_quote(f['path'])}\n")
+
+            report.write("\n")
+
+        report.write("\n---\n\n")
+        report.write(f"Total recoverable: **{human_size(total_all)}**\n")
+
+    script_path.chmod(0o755)
+    return report_path, script_path
+
+
 def prune_old_reports(output_dir: Path, keep: int = 5) -> None:
     """Delete report/script sets beyond the most recent `keep` runs of each type."""
     families = [
         # (glob anchor, companion prefixes to delete alongside)
         ("plex_duplicate_report", ["plex_duplicate_report", "plex_purge_candidates"]),
         ("plex_torrent_cleanup",  ["plex_torrent_cleanup"]),
+        ("plex_junk_report",      ["plex_junk_report", "plex_junk_candidates"]),
     ]
 
     for anchor_prefix, cleanup_prefixes in families:
@@ -867,6 +1079,7 @@ def apply_script(config: dict, script_path_str: str) -> None:
 _APPLY_SHORTCUTS = {
     "plex":    "plex_purge_candidates_*.sh",
     "torrent": "plex_torrent_cleanup_*.sh",
+    "junk":    "plex_junk_candidates_*.sh",
 }
 
 
@@ -892,10 +1105,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--apply",
-        metavar="SCRIPT|plex|torrent",
+        metavar="SCRIPT|plex|torrent|junk",
         help=(
             "SSH into the server and run a reviewed script. "
-            "Pass a path, or use 'plex' / 'torrent' to pick the most recent script of that type."
+            "Pass a path, or use 'plex', 'torrent', or 'junk' to pick the most recent script of that type."
         ),
     )
     parser.add_argument(
@@ -966,6 +1179,20 @@ def main() -> None:
             else:
                 print("No torrent entries found.")
 
+        junk_files: list[dict] = []
+        sample_files: list[dict] = []
+        extras_files: list[dict] = []
+
+        if config.get("scan_junk"):
+            print("Scanning for junk files...")
+            raw_junk = run_remote_junk_scan(client, config)
+            if raw_junk:
+                print(f"Found {len(raw_junk)} candidate files.")
+                junk_files, sample_files, extras_files = classify_junk_files(raw_junk, config)
+                print(f"  Junk: {len(junk_files)}, Samples: {len(sample_files)}, Extras: {len(extras_files)}")
+            else:
+                print("No junk files found.")
+
         if args.dry_run:
             prefer = config.get("prefer", {})
             purge_bytes = sum(
@@ -982,6 +1209,10 @@ def main() -> None:
                 print(f"  Torrent matched:    {len(matched)} ({human_size(sum(t['size'] for t in matched))})")
                 print(f"  Plex has alternate: {len(has_alternate)} ({human_size(sum(t['size'] for t in has_alternate))})")
                 print(f"  True orphans:       {len(true_orphans)} ({human_size(sum(t['size'] for t in true_orphans))})")
+            if junk_files or sample_files or extras_files:
+                print(f"  Junk files:         {len(junk_files)} ({human_size(sum(f['size'] for f in junk_files))})")
+                print(f"  Sample files:       {len(sample_files)} ({human_size(sum(f['size'] for f in sample_files))})")
+                print(f"  Extras:             {len(extras_files)} ({human_size(sum(f['size'] for f in extras_files))})")
             return
 
         report_path, purge_path = write_reports(config, duplicate_groups)
@@ -994,6 +1225,12 @@ def main() -> None:
             print()
             print(f"Torrent cleanup report: {torrent_report}")
             print(f"Torrent cleanup script: {torrent_script}")
+
+        if junk_files or sample_files or extras_files:
+            junk_report, junk_script = write_junk_report(config, junk_files, sample_files, extras_files)
+            print()
+            print(f"Junk file report:  {junk_report}")
+            print(f"Junk file script:  {junk_script}")
 
         output_dir = Path(config.get("output_dir", "./reports"))
         prune_old_reports(output_dir)

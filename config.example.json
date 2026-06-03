@@ -29,5 +29,7 @@
     "prefer_larger_file": true
   },
   "min_size_mb": 0,
-  "editor": "vim"
+  "editor": "vim",
+  "scan_junk": false,
+  "keep_local_artwork": true
 }

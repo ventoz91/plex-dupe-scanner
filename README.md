@@ -53,6 +53,8 @@ cp config.example.json config.json
 | `prefer.prefer_larger_file` | | Add file size to the score when comparing duplicates (default: `true`) |
 | `torrent_paths` | | Torrent download directories on the server — omit to skip torrent cleanup |
 | `torrent_orphan_move_dest` | | Destination path used in the `mv` line for orphan torrents |
+| `scan_junk` | | Set `true` to scan for junk/extras files in `media_paths` (default: `false`) |
+| `keep_local_artwork` | | Keep local Plex artwork files (`poster.jpg`, `fanart.jpg`, etc.) during junk scan (default: `true`) |
 
 > **Note on `prefer_larger_file`:** The size bonus is log-scaled so it acts as a tiebreaker
 > within a quality tier rather than overriding it. A 50 GB file adds at most ~780 pts vs a
@@ -131,6 +133,7 @@ Or use the shorthand to apply the most recent script of a given type:
 ```bash
 python plex_dupe_scan.py --apply plex     # most recent purge script
 python plex_dupe_scan.py --apply torrent  # most recent torrent cleanup script
+python plex_dupe_scan.py --apply junk     # most recent junk file script
 ```
 
 If your SSH user doesn't own the torrent files (e.g. they're owned by the torrent client), set `ssh.sudo: true` in config. You'll be prompted for the sudo password before connecting.
@@ -204,6 +207,23 @@ mv -v -- '/path/to/orphan' '/path/to/staging/'
 ```
 
 Comment out the `mv` line to delete instead, or comment out the `rm` line to move.
+
+### Junk file scan (when `scan_junk: true`)
+
+| File | Description |
+|---|---|
+| `plex_junk_report_<timestamp>.md` | Report listing junk, sample, and extras files |
+| `plex_junk_candidates_<timestamp>.sh` | Shell script for cleanup |
+
+Files are classified into three categories:
+
+| Category | What it catches | Notes |
+|---|---|---|
+| **Junk files** | `.nfo`, `.sfv`, `.txt`, stray images, etc. | Release detritus from torrent downloads |
+| **Sample files** | Video files with `sample` in the name | Preview clips bundled with releases |
+| **Extras / bonus content** | Files inside `Featurettes/`, `Behind the Scenes/`, `Trailers/`, etc. | Plex Pass users can browse these — only delete if you don't need them |
+
+Set `keep_local_artwork: true` (the default) to preserve `poster.jpg`, `fanart.jpg`, and other Plex local media assets from being flagged as junk.
 
 ### Report retention
 
