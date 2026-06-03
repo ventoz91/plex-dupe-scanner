@@ -43,6 +43,7 @@ cp config.example.json config.json
 | `ssh.host` | ✓ | IP address or hostname of your Plex server |
 | `ssh.port` | | SSH port (default: `22`) |
 | `ssh.username` | ✓ | SSH username |
+| `ssh.sudo` | | Set `true` if the SSH user needs `sudo` to delete torrent files (default: `false`) |
 | `media_paths` | ✓ | Directories on the server to scan for media files |
 | `extensions` | ✓ | File extensions to include in the scan |
 | `output_dir` | | Local directory for generated reports (default: `./reports`) |
@@ -124,6 +125,8 @@ Once you have reviewed a generated script, you can run it on the server directly
 ```bash
 python plex_dupe_scan.py --apply reports/plex_purge_candidates_<timestamp>.sh
 ```
+
+If your SSH user doesn't own the torrent files (e.g. they're owned by the torrent client), set `ssh.sudo: true` in config. You'll be prompted for the sudo password before connecting.
 
 The script will SSH into the server, run the cleanup, and print a summary:
 

@@ -755,8 +755,15 @@ def apply_script(config: dict, script_path_str: str) -> None:
     target_paths = {t["path"] for t in targets}
     planned_size = sum(t["size"] for t in targets)
 
+    use_sudo = config.get("ssh", {}).get("sudo", False)
+    sudo_password: str | None = None
+    if use_sudo:
+        sudo_password = getpass.getpass("Sudo password for remote server: ")
+
     print(f"Script:  {script_path.name}")
     print(f"Targets: {len(targets)} entries ({human_size(planned_size)})")
+    if use_sudo:
+        print("Mode:    sudo")
     print()
 
     # Prepare for non-interactive remote execution:
@@ -776,7 +783,10 @@ def apply_script(config: dict, script_path_str: str) -> None:
 
     try:
         print("Running script on server...")
-        stdin, stdout, stderr_ch = client.exec_command("bash -s", timeout=None)
+        remote_cmd = "sudo -S bash -s" if use_sudo else "bash -s"
+        stdin, stdout, stderr_ch = client.exec_command(remote_cmd, timeout=None)
+        if use_sudo and sudo_password is not None:
+            stdin.write(sudo_password + "\n")
         stdin.write(exec_script)
         stdin.channel.shutdown_write()
 
@@ -810,7 +820,11 @@ def apply_script(config: dict, script_path_str: str) -> None:
                 if mv_m and mv_m.group(1) in target_paths:
                     top_level_done.add(mv_m.group(1))
 
-        err_lines = [l for l in err_text.splitlines() if l.strip()]
+        # Filter out the sudo password prompt that lands on stderr
+        err_lines = [
+            l for l in err_text.splitlines()
+            if l.strip() and not re.match(r"^\[sudo\] password", l)
+        ]
 
         actual_size_freed = sum(t["size"] for t in targets if t["path"] in top_level_done)
         affected_dirs = {str(Path(p).parent) for p in top_level_done}
