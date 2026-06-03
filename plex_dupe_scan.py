@@ -196,35 +196,47 @@ def run_remote_junk_scan(client: paramiko.SSHClient, config: dict) -> list[dict]
         "extensions": config["extensions"],
     })
 
-    # _EXTRAS_DIRS serialised as a Python set literal inside the one-liner
-    extras_set = repr(_EXTRAS_DIRS)
+    extras_set      = repr(_EXTRAS_DIRS)
+    broad_vid_str   = repr(_BROAD_VIDEO_EXTS)
+    always_keep_str = repr(_ALWAYS_KEEP_EXTS)
 
     command = "python3 -c " + shlex.quote(
-        "import json,os,sys,re\n"
+        "import json,os,sys,re,subprocess\n"
         "cfg=json.loads(sys.stdin.read())\n"
         "media_paths=cfg['media_paths']\n"
         "video_exts=set(e.lower() for e in cfg['extensions'])\n"
         "sub_exts={'.srt','.sub','.idx','.ass','.ssa','.vtt','.sup','.smi','.sbv'}\n"
+        f"broad_vid_exts={broad_vid_str}\n"
+        f"always_keep={always_keep_str}\n"
         f"extras_dirs={extras_set}\n"
         "def in_ex(path):\n"
         "    parts=[p.strip().lower() for p in path.replace(os.sep,'/').split('/')]\n"
         "    return any(p in extras_dirs for p in parts)\n"
+        "def is_vid_by_magic(fp):\n"
+        "    try:\n"
+        "        r=subprocess.run(['file','-b','--mime-type',fp],capture_output=True,text=True,timeout=5)\n"
+        "        return r.returncode==0 and r.stdout.strip().startswith('video/')\n"
+        "    except Exception:return False\n"
         "results=[]\n"
         "for rp in media_paths:\n"
         "    for root,dirs,files in os.walk(rp):\n"
         "        for name in files:\n"
         "            ext=os.path.splitext(name)[1].lower()\n"
+        "            if ext in always_keep:continue\n"
         "            is_vid=ext in video_exts\n"
+        "            is_broad=ext in broad_vid_exts\n"
         "            is_sub=ext in sub_exts\n"
         "            fp=os.path.join(root,name)\n"
         "            is_ex=in_ex(fp)\n"
         "            is_samp=bool(re.search(r'\\bsample\\b',name,re.IGNORECASE))\n"
-        "            if (is_vid and not is_ex and not is_samp) or (is_sub and not is_ex):\n"
-        "                continue\n"
+        "            if (is_vid or is_broad) and not is_ex and not is_samp:continue\n"
+        "            if is_sub and not is_ex:continue\n"
+        "            if not is_vid and not is_broad and not is_sub:\n"
+        "                if is_vid_by_magic(fp):continue\n"
         "            try:stat=os.stat(fp)\n"
         "            except OSError:continue\n"
         "            results.append({'path':fp,'name':name,'size':stat.st_size,"
-        "'is_video':is_vid,'in_extras':is_ex,'is_sample':is_samp})\n"
+        "'is_video':is_vid or is_broad,'in_extras':is_ex,'is_sample':is_samp})\n"
         "print(json.dumps(results))\n"
     )
 
@@ -300,12 +312,26 @@ _PLEX_ARTWORK_STEMS = frozenset({
 
 _ARTWORK_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
-# Directory names that Plex uses for extras (case-insensitive match).
+# Directory names that Plex uses for bonus extras (case-insensitive match).
+# NOTE: "specials" is intentionally excluded — Plex uses a Specials/ folder for
+# Season 0 / S00Exx episodes which are legitimate library content, not bonus extras.
 _EXTRAS_DIRS = frozenset({
     "behind the scenes", "deleted scenes", "featurettes", "interviews",
     "scenes", "shorts", "trailers", "extras", "bts", "bonus",
-    "bonus features", "special features", "specials",
+    "bonus features", "special features",
 })
+
+# Video extensions beyond the user's config that are always treated as media.
+# Prevents common formats (.ts, .iso, .vob, etc.) from being flagged as junk
+# even when the user hasn't added them to their extensions list.
+_BROAD_VIDEO_EXTS = frozenset({
+    ".ts", ".iso", ".vob", ".m2ts", ".mts", ".m2v", ".mpg", ".mpeg",
+    ".divx", ".xvid", ".flv", ".3gp", ".webm", ".ogv", ".asf",
+    ".rm", ".rmvb", ".tp", ".trp", ".ifo", ".bup", ".dat",
+})
+
+# Extensions Plex creates itself — always preserve, never flag as junk.
+_ALWAYS_KEEP_EXTS = frozenset({".plexmatch", ".edl"})
 
 
 def _clean_torrent_name(name: str) -> str:
