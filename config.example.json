@@ -26,5 +26,6 @@
     "resolution_order": ["2160p", "1080p", "720p", "480p"],
     "codec_order": ["x265", "hevc", "x264", "h264"],
     "prefer_larger_file": true
-  }
+  },
+  "min_size_mb": 0
 }

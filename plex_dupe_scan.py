@@ -19,6 +19,21 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
+def validate_config(config: dict) -> None:
+    ssh = config.get("ssh", {})
+    errors: list[str] = []
+    if not ssh.get("host"):
+        errors.append("  ssh.host is required")
+    if not ssh.get("username"):
+        errors.append("  ssh.username is required")
+    if not isinstance(config.get("media_paths"), list) or not config.get("media_paths"):
+        errors.append("  media_paths must be a non-empty list")
+    if not isinstance(config.get("extensions"), list) or not config.get("extensions"):
+        errors.append("  extensions must be a non-empty list")
+    if errors:
+        sys.exit("Config errors:\n" + "\n".join(errors))
+
+
 def connect_ssh(config: dict) -> paramiko.SSHClient:
     ssh_cfg = config["ssh"]
 
@@ -27,7 +42,12 @@ def connect_ssh(config: dict) -> paramiko.SSHClient:
     username = ssh_cfg["username"]
 
     client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.load_system_host_keys()
+    try:
+        client.load_host_keys(os.path.expanduser("~/.ssh/known_hosts"))
+    except (FileNotFoundError, OSError):
+        pass
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
 
     try:
         client.connect(
@@ -39,7 +59,10 @@ def connect_ssh(config: dict) -> paramiko.SSHClient:
             timeout=15,
         )
         return client
-    except Exception:
+    except paramiko.BadHostKeyException as e:
+        sys.exit(f"Host key mismatch for {host}: {e}\nCheck ~/.ssh/known_hosts")
+    except paramiko.AuthenticationException as e:
+        print(f"Key/agent auth failed ({e}), trying password...")
         password = getpass.getpass(f"SSH password for {username}@{host}: ")
         client.connect(
             hostname=host,
@@ -51,6 +74,13 @@ def connect_ssh(config: dict) -> paramiko.SSHClient:
             timeout=15,
         )
         return client
+    except (paramiko.SSHException, OSError) as e:
+        if "not found in known_hosts" in str(e):
+            sys.exit(
+                f"Host key for {host} not in known_hosts.\n"
+                f"Run once to add it:  ssh-keyscan -H {host} >> ~/.ssh/known_hosts"
+            )
+        sys.exit(f"SSH connection failed: {e}")
 
 
 def run_remote_python(client: paramiko.SSHClient, config: dict) -> list[dict]:
@@ -355,6 +385,8 @@ def score_file(item: dict, prefer: dict) -> int:
     if codec in codec_order:
         score += (len(codec_order) - codec_order.index(codec)) * 100
 
+    # TODO: The MB-scale bonus can let a very large lower-res file outscore a smaller
+    # higher-res one (e.g. 50 GB 720p vs 2 GB 1080p). Consider log-scaling or capping.
     if prefer.get("prefer_larger_file", True):
         score += int(item["size"] / 1024 / 1024)
 
@@ -717,11 +749,10 @@ def apply_script(config: dict, script_path_str: str) -> None:
 
     targets: list[dict] = json.loads(meta_match.group(1))
     target_paths = {t["path"] for t in targets}
-    total_size = sum(t["size"] for t in targets)
-    affected_dirs = {str(Path(t["path"]).parent) for t in targets}
+    planned_size = sum(t["size"] for t in targets)
 
     print(f"Script:  {script_path.name}")
-    print(f"Targets: {len(targets)} entries ({human_size(total_size)})")
+    print(f"Targets: {len(targets)} entries ({human_size(planned_size)})")
     print()
 
     # Prepare for non-interactive remote execution:
@@ -777,6 +808,9 @@ def apply_script(config: dict, script_path_str: str) -> None:
 
         err_lines = [l for l in err_text.splitlines() if l.strip()]
 
+        actual_size_freed = sum(t["size"] for t in targets if t["path"] in top_level_done)
+        affected_dirs = {str(Path(p).parent) for p in top_level_done}
+
         w = 28
         print()
         print("── Summary " + "─" * 46)
@@ -784,7 +818,7 @@ def apply_script(config: dict, script_path_str: str) -> None:
         print(f"  {'Files removed:':{w}} {files_removed}")
         print(f"  {'Directories removed:':{w}} {dirs_removed}")
         print(f"  {'Items moved:':{w}} {moved_count}")
-        print(f"  {'Space freed (estimated):':{w}} {human_size(total_size)}")
+        print(f"  {'Space freed (estimated):':{w}} {human_size(actual_size_freed)}")
         print()
         print(f"  Directories affected ({len(affected_dirs)}):")
         for d in sorted(affected_dirs):
@@ -817,9 +851,15 @@ def main() -> None:
         metavar="SCRIPT",
         help="SSH into the server and run a reviewed script (HasBeenChecked must be true).",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print duplicate/torrent stats without writing any report files.",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
+    validate_config(config)
 
     if args.apply:
         apply_script(config, args.apply)
@@ -833,19 +873,25 @@ def main() -> None:
         files = run_remote_python(client, config)
         print(f"Found {len(files)} media files.")
 
+        min_size_bytes = int(config.get("min_size_mb", 0)) * 1024 * 1024
+        if min_size_bytes:
+            before = len(files)
+            files = [f for f in files if f["size"] >= min_size_bytes]
+            filtered = before - len(files)
+            if filtered:
+                print(f"Filtered {filtered} files below {config['min_size_mb']} MB.")
+
         duplicate_groups = group_duplicates(files)
         print(f"Found {len(duplicate_groups)} possible duplicate groups.")
-        report_path, purge_path = write_reports(config, duplicate_groups)
 
-        print()
-        print(f"Duplicate report:  {report_path}")
-        print(f"Purge script:      {purge_path}")
+        torrents: list[dict] = []
+        matched: list[dict] = []
+        has_alternate: list[dict] = []
+        true_orphans: list[dict] = []
 
         if config.get("torrent_paths"):
-            print()
             print("Scanning torrent directories...")
             torrents = run_remote_torrent_scan(client, config)
-
             if torrents:
                 print(f"Found {len(torrents)} torrent entries.")
                 exact_keys, season_keys, title_only_keys, base_title_keys = build_torrent_match_sets(files)
@@ -853,12 +899,37 @@ def main() -> None:
                     torrents, exact_keys, season_keys, title_only_keys, base_title_keys
                 )
                 print(f"  Exact match: {len(matched)}, Plex has alternate: {len(has_alternate)}, True orphans: {len(true_orphans)}")
-                torrent_report, torrent_script = write_torrent_report(config, matched, has_alternate, true_orphans)
-                print()
-                print(f"Torrent cleanup report: {torrent_report}")
-                print(f"Torrent cleanup script: {torrent_script}")
             else:
                 print("No torrent entries found.")
+
+        if args.dry_run:
+            prefer = config.get("prefer", {})
+            purge_bytes = sum(
+                item["size"]
+                for items in duplicate_groups.values()
+                for item in sorted(items, key=lambda i: score_file(i, prefer), reverse=True)[1:]
+            )
+            purge_count = sum(len(items) - 1 for items in duplicate_groups.values())
+            print()
+            print("── Dry run summary " + "─" * 38)
+            print(f"  Duplicate groups:   {len(duplicate_groups)}")
+            print(f"  Files to purge:     {purge_count} ({human_size(purge_bytes)})")
+            if torrents:
+                print(f"  Torrent matched:    {len(matched)} ({human_size(sum(t['size'] for t in matched))})")
+                print(f"  Plex has alternate: {len(has_alternate)} ({human_size(sum(t['size'] for t in has_alternate))})")
+                print(f"  True orphans:       {len(true_orphans)} ({human_size(sum(t['size'] for t in true_orphans))})")
+            return
+
+        report_path, purge_path = write_reports(config, duplicate_groups)
+        print()
+        print(f"Duplicate report:  {report_path}")
+        print(f"Purge script:      {purge_path}")
+
+        if torrents:
+            torrent_report, torrent_script = write_torrent_report(config, matched, has_alternate, true_orphans)
+            print()
+            print(f"Torrent cleanup report: {torrent_report}")
+            print(f"Torrent cleanup script: {torrent_script}")
 
         output_dir = Path(config.get("output_dir", "./reports"))
         prune_old_reports(output_dir)
