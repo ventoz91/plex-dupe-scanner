@@ -682,7 +682,7 @@ def write_torrent_report(
 
             for t in sorted(has_alternate, key=lambda x: x["path"]):
                 report.write(f"| {human_size(t['size'])} | `{t['path']}` |\n")
-                flag = "-rf" if t["is_dir"] else "-f"
+                flag = "-rfv" if t["is_dir"] else "-fv"
                 script.write(f"rm {flag} -- {shell_quote(t['path'])}\n")
 
             report.write("\n")
