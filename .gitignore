@@ -1,0 +1,21 @@
+# Personal config — copy config.example.json to config.json and fill in your details
+config.json
+
+# Generated reports and cleanup scripts
+reports/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
