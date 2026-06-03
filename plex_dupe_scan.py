@@ -164,6 +164,20 @@ _TORRENT_JUNK = [
     r"\batmos\b",
 ]
 
+# Where the actual title ends and "technical" info begins.
+# Used to extract a bare show/movie name for broad alternate matching.
+_TITLE_BOUNDARY = re.compile(
+    r"\b(?:"
+    r"19\d{2}|20[0-2]\d|"               # year
+    r"2160p|1080p|720p|480p|4k|uhd|"    # resolution
+    r"bluray|blu.ray|webrip|web.dl|hdtv|dvdrip|"  # source
+    r"x265|hevc|x264|h264|"             # codec
+    r"s\d{1,2}e\d{1,2}|s\d{1,2}(?=\b)|"  # SxxExx / Sxx
+    r"complete|series|collection|trilogy|pack|season"  # pack descriptors
+    r")",
+    re.IGNORECASE,
+)
+
 
 def normalize_title(filename: str) -> str:
     name = os.path.splitext(filename)[0].lower()
@@ -191,6 +205,20 @@ def normalize_for_torrent_match(name: str) -> str:
     name = re.sub(r"\s+", " ", name).strip()
 
     return name
+
+
+def extract_base_title(name: str) -> str:
+    """
+    Extract just the show/movie title, stopping at the first year, resolution,
+    codec, season marker, or pack descriptor.  Used for broad alternate matching.
+    """
+    name = os.path.splitext(name)[0]
+    name = re.sub(r"-[A-Za-z0-9]+\s*$", "", name)   # strip release group
+    name = re.sub(r"[\._\-\[\]\(\)]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip().lower()
+
+    m = _TITLE_BOUNDARY.search(name)
+    return name[:m.start()].strip() if m else name
 
 
 # ── Season / episode extraction ───────────────────────────────────────────────
@@ -302,17 +330,20 @@ def group_duplicates(files: list[dict]) -> dict[str, list[dict]]:
 
 # ── Torrent-to-Plex matching ──────────────────────────────────────────────────
 
-def build_torrent_match_sets(files: list[dict]) -> tuple[set[str], set[str], set[str]]:
+def build_torrent_match_sets(files: list[dict]) -> tuple[set[str], set[str], set[str], set[str]]:
     """
-    Build three key sets from scanned media files for torrent matching:
+    Build four key sets from scanned media files for torrent matching:
 
-    exact_keys      – full normalised key per file (title + year, or title + SxxExx)
-    season_keys     – show + season only, e.g. "friends s01" (for season-pack torrents)
-    title_only_keys – bare title without year or season (for torrents that omit year)
+    exact_keys       – full normalised key per file (title + year, or title + SxxExx)
+    season_keys      – show + season only, e.g. "friends s01" (for season-pack torrents)
+    title_only_keys  – bare title without year or season (for torrents that omit year)
+    base_title_keys  – show/movie name only, stopping before any technical token;
+                       used for broad "alternate exists in Plex" matching
     """
     exact_keys: set[str] = set()
     season_keys: set[str] = set()
     title_only_keys: set[str] = set()
+    base_title_keys: set[str] = set()
 
     for item in files:
         norm = normalize_for_torrent_match(item["name"])
@@ -331,7 +362,12 @@ def build_torrent_match_sets(files: list[dict]) -> tuple[set[str], set[str], set
         if title_only and title_only != norm:
             title_only_keys.add(title_only)
 
-    return exact_keys, season_keys, title_only_keys
+        # Broadest form: just the show/movie name before any technical token
+        base = extract_base_title(item["name"])
+        if base:
+            base_title_keys.add(base)
+
+    return exact_keys, season_keys, title_only_keys, base_title_keys
 
 
 def torrent_in_plex(
@@ -340,6 +376,7 @@ def torrent_in_plex(
     season_keys: set[str],
     title_only_keys: set[str],
 ) -> bool:
+    """True when the torrent closely matches a specific Plex entry."""
     norm = normalize_for_torrent_match(name)
     if not norm:
         return False
@@ -358,22 +395,46 @@ def torrent_in_plex(
     return False
 
 
+def torrent_has_alternate(name: str, base_title_keys: set[str]) -> bool:
+    """
+    True when the torrent's show/movie title exists in Plex under any version.
+
+    Used for orphans that slipped through exact matching (e.g. a complete-series
+    pack or a differently-labelled edition) — Plex already has the content, so
+    the torrent is redundant even if the names don't align precisely.
+    """
+    base = extract_base_title(name)
+    return bool(base) and base in base_title_keys
+
+
 def classify_torrents(
     torrents: list[dict],
     exact_keys: set[str],
     season_keys: set[str],
     title_only_keys: set[str],
-) -> tuple[list[dict], list[dict]]:
-    matched: list[dict] = []   # found in Plex — ask before deleting
-    orphans: list[dict] = []   # not in Plex — delete directly
+    base_title_keys: set[str],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """
+    Returns (matched, has_alternate, true_orphans).
+
+    matched       – close match to a Plex entry → interactive rm
+    has_alternate – title exists in Plex but naming didn't align exactly
+                    (different quality, edition, complete-series pack, etc.) → direct rm
+    true_orphans  – nothing in Plex for this title → mv/rm choice
+    """
+    matched: list[dict] = []
+    has_alternate: list[dict] = []
+    true_orphans: list[dict] = []
 
     for t in torrents:
         if torrent_in_plex(t["name"], exact_keys, season_keys, title_only_keys):
             matched.append(t)
+        elif torrent_has_alternate(t["name"], base_title_keys):
+            has_alternate.append(t)
         else:
-            orphans.append(t)
+            true_orphans.append(t)
 
-    return matched, orphans
+    return matched, has_alternate, true_orphans
 
 
 # ── Formatting helpers ────────────────────────────────────────────────────────
@@ -456,7 +517,8 @@ def write_reports(config: dict, duplicate_groups: dict[str, list[dict]]) -> tupl
 def write_torrent_report(
     config: dict,
     matched: list[dict],
-    orphans: list[dict],
+    has_alternate: list[dict],
+    true_orphans: list[dict],
 ) -> tuple[Path, Path]:
     output_dir = Path(config.get("output_dir", "./reports"))
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -466,15 +528,18 @@ def write_torrent_report(
     script_path = output_dir / f"plex_torrent_cleanup_{stamp}.sh"
 
     total_matched = sum(t["size"] for t in matched)
-    total_orphan = sum(t["size"] for t in orphans)
+    total_alternate = sum(t["size"] for t in has_alternate)
+    total_orphan = sum(t["size"] for t in true_orphans)
+    total_all = total_matched + total_alternate + total_orphan
 
     with open(report_path, "w", encoding="utf-8") as report, \
          open(script_path, "w", encoding="utf-8") as script:
 
         report.write("# Plex Torrent Cleanup Report\n\n")
         report.write(f"Generated: {datetime.now().isoformat(timespec='seconds')}\n\n")
-        report.write(f"- Already in Plex (review before deleting): **{len(matched)}** ({human_size(total_matched)})\n")
-        report.write(f"- Orphans (not found in Plex): **{len(orphans)}** ({human_size(total_orphan)})\n\n")
+        report.write(f"- Exact Plex match (review before deleting): **{len(matched)}** ({human_size(total_matched)})\n")
+        report.write(f"- Plex has alternate version (safe to delete): **{len(has_alternate)}** ({human_size(total_alternate)})\n")
+        report.write(f"- True orphans (no Plex title match): **{len(true_orphans)}** ({human_size(total_orphan)})\n\n")
 
         script.write("#!/usr/bin/env bash\n")
         script.write("set -euo pipefail\n\n")
@@ -482,13 +547,13 @@ def write_torrent_report(
         script.write("# Run ON THE PLEX SERVER, not your local machine.\n\n")
 
         if matched:
-            report.write("## Already in Plex\n\n")
-            report.write("These torrents have a matching entry in your Plex library. ")
+            report.write("## Exact Plex Match\n\n")
+            report.write("These torrents match an entry in your Plex library directly. ")
             report.write("Delete them if you no longer need to seed.\n\n")
             report.write("| Size | Path |\n")
             report.write("|---:|---|\n")
 
-            script.write("# ── Already in Plex — delete interactively ──────────────────────\n\n")
+            script.write("# ── Exact Plex match — delete interactively ─────────────────────\n\n")
 
             for t in sorted(matched, key=lambda x: x["path"]):
                 report.write(f"| {human_size(t['size'])} | `{t['path']}` |\n")
@@ -497,26 +562,43 @@ def write_torrent_report(
 
             report.write("\n")
 
-        if orphans:
-            move_dest = config.get("torrent_orphan_move_dest", "MOVE_DESTINATION/")
-
-            report.write("## Orphans\n\n")
-            report.write("These torrents have no matching entry in your Plex library. ")
-            report.write("They may be failed downloads, incomplete imports, or mislabelled files.\n\n")
+        if has_alternate:
+            report.write("## Plex Has Alternate Version\n\n")
+            report.write("Plex already has this title but the torrent name did not align precisely ")
+            report.write("(different edition, quality tier, complete-series pack, etc.). ")
+            report.write("The content is covered — these are safe to delete.\n\n")
             report.write("| Size | Path |\n")
             report.write("|---:|---|\n")
 
-            script.write("\n# ── Orphans — no Plex match found ───────────────────────────────\n")
+            script.write("\n# ── Plex has alternate version — delete directly ─────────────────\n\n")
+
+            for t in sorted(has_alternate, key=lambda x: x["path"]):
+                report.write(f"| {human_size(t['size'])} | `{t['path']}` |\n")
+                flag = "-rf" if t["is_dir"] else "-f"
+                script.write(f"rm {flag} -- {shell_quote(t['path'])}\n")
+
+            report.write("\n")
+
+        if true_orphans:
+            move_dest = config.get("torrent_orphan_move_dest", "MOVE_DESTINATION/")
+
+            report.write("## True Orphans\n\n")
+            report.write("No version of this title was found in your Plex library. ")
+            report.write("They may be failed downloads, in-progress imports, or content removed from Plex.\n\n")
+            report.write("| Size | Path |\n")
+            report.write("|---:|---|\n")
+
+            script.write("\n# ── True orphans — no Plex title match ──────────────────────────\n")
             script.write("# For each entry: keep the action you want and comment out the other.\n\n")
 
-            for t in sorted(orphans, key=lambda x: x["path"]):
+            for t in sorted(true_orphans, key=lambda x: x["path"]):
                 report.write(f"| {human_size(t['size'])} | `{t['path']}` |\n")
                 rm_flag = "-rf" if t["is_dir"] else "-f"
                 script.write(f"mv -v -- {shell_quote(t['path'])} {shell_quote(move_dest)}\n")
                 script.write(f"# rm {rm_flag} -- {shell_quote(t['path'])}\n\n")
 
         report.write(f"\n---\n\n")
-        report.write(f"Total recoverable: **{human_size(total_matched + total_orphan)}**\n")
+        report.write(f"Total recoverable: **{human_size(total_all)}**\n")
 
     script_path.chmod(0o755)
 
@@ -560,10 +642,12 @@ def main() -> None:
 
             if torrents:
                 print(f"Found {len(torrents)} torrent entries.")
-                exact_keys, season_keys, title_only_keys = build_torrent_match_sets(files)
-                matched, orphans = classify_torrents(torrents, exact_keys, season_keys, title_only_keys)
-                print(f"  Matched to Plex: {len(matched)}, Orphans: {len(orphans)}")
-                torrent_report, torrent_script = write_torrent_report(config, matched, orphans)
+                exact_keys, season_keys, title_only_keys, base_title_keys = build_torrent_match_sets(files)
+                matched, has_alternate, true_orphans = classify_torrents(
+                    torrents, exact_keys, season_keys, title_only_keys, base_title_keys
+                )
+                print(f"  Exact match: {len(matched)}, Plex has alternate: {len(has_alternate)}, True orphans: {len(true_orphans)}")
+                torrent_report, torrent_script = write_torrent_report(config, matched, has_alternate, true_orphans)
                 print()
                 print(f"Torrent cleanup report: {torrent_report}")
                 print(f"Torrent cleanup script: {torrent_script}")
