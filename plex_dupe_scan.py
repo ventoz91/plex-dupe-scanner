@@ -134,16 +134,20 @@ def run_remote_torrent_scan(client: paramiko.SSHClient, config: dict) -> list[di
     payload = json.dumps({"torrent_paths": torrent_paths})
 
     command = "python3 -c " + shlex.quote(
-        "import json,os,sys\n"
+        "import json,os,sys,subprocess\n"
         "cfg=json.loads(sys.stdin.read())\n"
         "def sz(p):\n"
         "    if os.path.isfile(p):\n"
         "        try:return os.path.getsize(p)\n"
         "        except OSError:return 0\n"
+        "    try:\n"
+        "        r=subprocess.run(['du','-sb',p],capture_output=True,text=True,timeout=120)\n"
+        "        if r.returncode==0:return int(r.stdout.split()[0])\n"
+        "    except Exception:pass\n"
         "    t=0\n"
-        "    for r,_,fs in os.walk(p):\n"
+        "    for r2,_,fs in os.walk(p):\n"
         "        for f in fs:\n"
-        "            fp=os.path.join(r,f)\n"
+        "            fp=os.path.join(r2,f)\n"
         "            try:\n"
         "                if not os.path.islink(fp):t+=os.path.getsize(fp)\n"
         "            except OSError:pass\n"
@@ -860,6 +864,25 @@ def apply_script(config: dict, script_path_str: str) -> None:
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+_APPLY_SHORTCUTS = {
+    "plex":    "plex_purge_candidates_*.sh",
+    "torrent": "plex_torrent_cleanup_*.sh",
+}
+
+
+def resolve_apply_target(target: str, config: dict) -> str:
+    """Resolve 'plex' or 'torrent' to the most recent matching script path."""
+    pattern = _APPLY_SHORTCUTS.get(target.lower())
+    if pattern is None:
+        return target
+    output_dir = Path(config.get("output_dir", "./reports"))
+    matches = sorted(output_dir.glob(pattern), reverse=True)
+    if not matches:
+        sys.exit(f"No {target} scripts found in {output_dir}")
+    print(f"Using: {matches[0]}")
+    return str(matches[0])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Scan Plex media over SSH for duplicate media files.")
     parser.add_argument(
@@ -869,8 +892,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--apply",
-        metavar="SCRIPT",
-        help="SSH into the server and run a reviewed script (HasBeenChecked must be true).",
+        metavar="SCRIPT|plex|torrent",
+        help=(
+            "SSH into the server and run a reviewed script. "
+            "Pass a path, or use 'plex' / 'torrent' to pick the most recent script of that type."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -900,7 +926,7 @@ def main() -> None:
         os.execvp(editor, [editor] + scripts)
 
     if args.apply:
-        apply_script(config, args.apply)
+        apply_script(config, resolve_apply_target(args.apply, config))
         return
 
     print("Connecting to Plex machine...")

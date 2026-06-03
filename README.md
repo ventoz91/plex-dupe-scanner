@@ -54,10 +54,10 @@ cp config.example.json config.json
 | `torrent_paths` | | Torrent download directories on the server — omit to skip torrent cleanup |
 | `torrent_orphan_move_dest` | | Destination path used in the `mv` line for orphan torrents |
 
-> **Note on `prefer_larger_file`:** The size bonus is in raw MB, which can let a very large
-> lower-resolution file outscore a smaller higher-resolution one. If you find the scoring
-> counter-intuitive, set `prefer_larger_file: false` and rely on resolution/codec order alone.
-> See TODO in `score_file()` for a planned fix.
+> **Note on `prefer_larger_file`:** The size bonus is log-scaled so it acts as a tiebreaker
+> within a quality tier rather than overriding it. A 50 GB file adds at most ~780 pts vs a
+> 1000 pt gap between resolution tiers, so a larger 720p file will never outscore a 1080p file.
+> Set `prefer_larger_file: false` to rely solely on resolution/codec order.
 
 ### Example config
 
@@ -124,6 +124,13 @@ Once you have reviewed a generated script, you can run it on the server directly
 
 ```bash
 python plex_dupe_scan.py --apply reports/plex_purge_candidates_<timestamp>.sh
+```
+
+Or use the shorthand to apply the most recent script of a given type:
+
+```bash
+python plex_dupe_scan.py --apply plex     # most recent purge script
+python plex_dupe_scan.py --apply torrent  # most recent torrent cleanup script
 ```
 
 If your SSH user doesn't own the torrent files (e.g. they're owned by the torrent client), set `ssh.sudo: true` in config. You'll be prompted for the sudo password before connecting.
