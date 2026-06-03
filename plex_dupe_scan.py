@@ -161,7 +161,12 @@ _TORRENT_JUNK = [
     r"\bcomplete\b", r"\bproper\b", r"\brepack\b",
     r"\bextended\b", r"\btheatrical\b", r"\bredux\b",
     r"\bremux\b", r"\bsdr\b", r"\bhdr\b", r"\bdolby\b",
-    r"\batmos\b",
+    r"\batmos\b", r"\bweb\b",
+    # Streaming service tags
+    r"\bamzn\b", r"\bdsnp\b", r"\bnf\b", r"\bhmax\b", r"\bpmtp\b",
+    # Additional codec / format tags not in QUALITY_JUNK
+    r"\bav1\b", r"\bopus\b", r"\bh[\s\-]?265\b", r"\bh[\s\-]?264\b",
+    r"\bddp\d*\b", r"\bdd\d+[\s\-]\d+\b",
 ]
 
 # Where the actual title ends and "technical" info begins.
@@ -173,14 +178,57 @@ _TITLE_BOUNDARY = re.compile(
     r"bluray|blu.ray|webrip|web.dl|hdtv|dvdrip|"  # source
     r"x265|hevc|x264|h264|"             # codec
     r"s\d{1,2}e\d{1,2}|s\d{1,2}(?=\b)|"  # SxxExx / Sxx
-    r"complete|series|collection|trilogy|pack|season"  # pack descriptors
+    r"complete|series|collection|trilogy|pack|"  # pack descriptors
+    r"season|stagione|saison|staffel|temporada"  # "season" in common languages
     r")",
     re.IGNORECASE,
 )
 
 
+_MEDIA_EXTS = frozenset({
+    ".mkv", ".mp4", ".avi", ".mov", ".m4v", ".wmv", ".ts", ".iso", ".m2ts",
+})
+
+
+def _clean_torrent_name(name: str) -> str:
+    """
+    Pre-clean a raw torrent file/folder name before normalisation.
+
+    Order matters:
+      1. Strip URL watermarks first (may contain periods that confuse splitext)
+         e.g. "www.SceneTime.com - " or "www.UIndex.org    -    "
+      2. Strip leading [Group] brackets  e.g. "[SubsPlease] ", "[HorribleSubs] "
+      3. Strip media file extension (must happen before trailing bracket strip
+         so "[F2AC7AA0].mkv" → "[F2AC7AA0]" → then the bracket is at the end)
+      4. Strip trailing tracker tags  e.g. "[EZTVx.to]", "[TGx]", "[rarbg]"
+      5. Strip trailing release group  e.g. "-FGT", "-MeGusta"
+      6. Strip broadcaster prefixes  e.g. "PBS " prepended to NOVA/Frontline etc.
+    """
+    # 1. URL watermarks
+    name = re.sub(r"^www\.\S+\s*[-–]+\s*", "", name, flags=re.IGNORECASE)
+    # 2. Leading group brackets
+    name = re.sub(r"^(?:\[[^\]]+\]\s*)+", "", name)
+    # 3. Media extension
+    root, ext = os.path.splitext(name)
+    if ext.lower() in _MEDIA_EXTS:
+        name = root
+    # 4. Trailing tracker/index tags
+    name = re.sub(r"(?:\s*\[[^\]]+\])+\s*$", "", name)
+    # 5. Trailing release group
+    name = re.sub(r"-[A-Za-z0-9]+\s*$", "", name)
+    # 6. Broadcaster prefixes (handle both space and dot as separator)
+    name = re.sub(r"^(?:PBS|BBC|ABC|NBC|CBS)[.\s]+", "", name, flags=re.IGNORECASE)
+    return name.strip()
+
+
+def _strip_apostrophes(name: str) -> str:
+    """Remove all apostrophe variants so Grey’s == Greys, Bob’s == Bobs."""
+    return re.sub(r"[\u0027\u2018\u2019\u02bc]", "", name)
+
+
 def normalize_title(filename: str) -> str:
     name = os.path.splitext(filename)[0].lower()
+    name = _strip_apostrophes(name)
 
     for pat in _QUALITY_JUNK:
         name = re.sub(pat, " ", name, flags=re.IGNORECASE)
@@ -192,12 +240,10 @@ def normalize_title(filename: str) -> str:
 
 
 def normalize_for_torrent_match(name: str) -> str:
-    """Like normalize_title but also strips release group suffix and torrent-specific terms."""
-    name = os.path.splitext(name)[0]
-    # Strip trailing release group, e.g. "-FGT", "-YIFY", "-NTG"
-    name = re.sub(r"-[A-Za-z0-9]+\s*$", "", name)
+    """Like normalize_title but pre-cleans torrent-specific name patterns first."""
+    name = _clean_torrent_name(name)
+    name = _strip_apostrophes(name).lower()
 
-    name = name.lower()
     for pat in _QUALITY_JUNK + _TORRENT_JUNK:
         name = re.sub(pat, " ", name, flags=re.IGNORECASE)
 
@@ -212,13 +258,15 @@ def extract_base_title(name: str) -> str:
     Extract just the show/movie title, stopping at the first year, resolution,
     codec, season marker, or pack descriptor.  Used for broad alternate matching.
     """
-    name = os.path.splitext(name)[0]
-    name = re.sub(r"-[A-Za-z0-9]+\s*$", "", name)   # strip release group
+    name = _clean_torrent_name(name)
+    name = _strip_apostrophes(name)
     name = re.sub(r"[\._\-\[\]\(\)]", " ", name)
     name = re.sub(r"\s+", " ", name).strip().lower()
 
     m = _TITLE_BOUNDARY.search(name)
-    return name[:m.start()].strip() if m else name
+    title = name[:m.start()].strip() if m else name
+    # Strip trailing bare episode number left by anime "- 24" style naming
+    return re.sub(r"\s+\d{1,3}\s*$", "", title).strip()
 
 
 # ── Season / episode extraction ───────────────────────────────────────────────
