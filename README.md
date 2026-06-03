@@ -1,5 +1,11 @@
 # plex-dupe-scanner
 
+> [!WARNING]
+> **This tool generates scripts that permanently delete files from your server.**
+> Always review every generated `.sh` file line by line before running it.
+> Deleted files are **not** moved to trash — they are gone. The authors accept no
+> responsibility for data loss. You have been warned.
+
 Scans your Plex media library over SSH, groups duplicate files by title, and optionally compares your torrent download directories against the library. Generates a human-readable Markdown report and a ready-to-run shell script for each task.
 
 ## Requirements
