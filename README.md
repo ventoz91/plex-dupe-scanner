@@ -6,7 +6,7 @@
 > Deleted files are **not** moved to trash — they are gone. The authors accept no
 > responsibility for data loss. You have been warned.
 
-Scans your Plex media library over SSH, groups duplicate files by title, and optionally compares your torrent download directories against the library. Generates a human-readable Markdown report and a ready-to-run shell script for each task.
+Scans your Plex media library over SSH, groups duplicate files by title, compares your torrent download directories against the library, and optionally flags junk/extras files. Generates a human-readable Markdown report and a ready-to-run shell script for each task.
 
 ## Requirements
 
@@ -43,7 +43,7 @@ cp config.example.json config.json
 | `ssh.host` | ✓ | IP address or hostname of your Plex server |
 | `ssh.port` | | SSH port (default: `22`) |
 | `ssh.username` | ✓ | SSH username |
-| `ssh.sudo` | | Set `true` if the SSH user needs `sudo` to delete torrent files (default: `false`) |
+| `ssh.sudo` | | Set `true` if the SSH user needs `sudo` to delete files (e.g. owned by torrent client) (default: `false`) |
 | `media_paths` | ✓ | Directories on the server to scan for media files |
 | `extensions` | ✓ | File extensions to include in the scan |
 | `output_dir` | | Local directory for generated reports (default: `./reports`) |
@@ -54,12 +54,17 @@ cp config.example.json config.json
 | `torrent_paths` | | Torrent download directories on the server — omit to skip torrent cleanup |
 | `torrent_orphan_move_dest` | | Destination path used in the `mv` line for orphan torrents |
 | `scan_junk` | | Set `true` to scan for junk/extras files in `media_paths` (default: `false`) |
-| `keep_local_artwork` | | Keep local Plex artwork files (`poster.jpg`, `fanart.jpg`, etc.) during junk scan (default: `true`) |
+| `keep_local_artwork` | | Preserve Plex artwork files (`poster.jpg`, `fanart.jpg`, etc.) during junk scan (default: `true`) |
+| `editor` | | Editor used by `--review` (default: `"vim"`) |
 
 > **Note on `prefer_larger_file`:** The size bonus is log-scaled so it acts as a tiebreaker
 > within a quality tier rather than overriding it. A 50 GB file adds at most ~780 pts vs a
 > 1000 pt gap between resolution tiers, so a larger 720p file will never outscore a 1080p file.
 > Set `prefer_larger_file: false` to rely solely on resolution/codec order.
+
+> **Note on `ssh.sudo`:** When enabled you will be prompted for the sudo password locally before
+> connecting. The password is sent to the remote `sudo -S bash -s` process over the existing SSH
+> channel — it is never stored.
 
 ### Example config
 
@@ -68,7 +73,8 @@ cp config.example.json config.json
   "ssh": {
     "host": "192.168.1.100",
     "port": 22,
-    "username": "admin"
+    "username": "admin",
+    "sudo": false
   },
   "media_paths": [
     "/mnt/plex/media/movies",
@@ -86,16 +92,23 @@ cp config.example.json config.json
     "resolution_order": ["2160p", "1080p", "720p", "480p"],
     "codec_order": ["x265", "hevc", "x264", "h264"],
     "prefer_larger_file": true
-  }
+  },
+  "scan_junk": false,
+  "keep_local_artwork": true,
+  "editor": "vim"
 }
 ```
 
-## Running
+## Commands
+
+### Scan (default)
 
 ```bash
 source .venv/bin/activate
 python plex_dupe_scan.py
 ```
+
+Connects to the server, scans media files, and writes reports and scripts to `output_dir`.
 
 To use a different config file:
 
@@ -103,24 +116,32 @@ To use a different config file:
 python plex_dupe_scan.py -c /path/to/my-config.json
 ```
 
-SSH authentication tries your SSH agent / keys first. If that fails, you will be prompted for a password.
+SSH authentication tries your agent / keys first. If that fails you will be prompted for a password.
 
 ### Dry run
 
-To see what would be found without writing any files:
+Scan and print a summary without writing any report files:
 
 ```bash
 python plex_dupe_scan.py --dry-run
 ```
 
-This connects, scans, and prints a summary table — no reports or scripts are written.
+### Review generated scripts
 
-### Applying a script remotely
+Open the most recent purge and torrent cleanup scripts in your editor:
 
-Once you have reviewed a generated script, you can run it on the server directly from your machine instead of copying it over manually:
+```bash
+python plex_dupe_scan.py --review
+```
 
-1. Open the generated `.sh` file in any editor.
-2. Remove any lines you do not want to execute.
+Defaults to `vim`. Use `:n` / `:prev` to move between files. Set a different editor with `"editor": "nano"` (or `"code"`, `"hx"`, etc.) in `config.json`.
+
+### Apply a script remotely
+
+Once you have reviewed a generated script, run it on the server directly from your machine:
+
+1. Open the generated `.sh` file (`--review` is the quickest way).
+2. Remove or comment out any lines you do not want to execute.
 3. Change `HasBeenChecked=false` to `HasBeenChecked=true`.
 4. Run:
 
@@ -128,23 +149,27 @@ Once you have reviewed a generated script, you can run it on the server directly
 python plex_dupe_scan.py --apply reports/plex_purge_candidates_<timestamp>.sh
 ```
 
-Or use the shorthand to apply the most recent script of a given type:
+Or use a shorthand to pick the most recent script of a given type automatically:
 
 ```bash
-python plex_dupe_scan.py --apply plex     # most recent purge script
+python plex_dupe_scan.py --apply plex     # most recent duplicate purge script
 python plex_dupe_scan.py --apply torrent  # most recent torrent cleanup script
 python plex_dupe_scan.py --apply junk     # most recent junk file script
 ```
 
-If your SSH user doesn't own the torrent files (e.g. they're owned by the torrent client), set `ssh.sudo: true` in config. You'll be prompted for the sudo password before connecting.
-
-The script will SSH into the server, run the cleanup, and print a summary:
+The script streams output live as it runs, then prints a summary:
 
 ```
 Script:  plex_purge_candidates_2026-06-03_14-00-00.sh
 Targets: 12 entries (47.30 GB)
 
-── Summary ──────────────────────────────────────────────
+Connecting to Plex machine...
+Running script on server...
+── Output ───────────────────────────────────────────
+  removed '/home/data/plex/media/movies/Movie.720p.mkv'
+  removed '/home/data/plex/media/tv/Show/S01E01.480p.mkv'
+  ...
+── Summary ──────────────────────────────────────────
   Targets processed:           12 / 12
   Files removed:               12
   Directories removed:         0
@@ -152,16 +177,18 @@ Targets: 12 entries (47.30 GB)
   Space freed (estimated):     47.30 GB
 
   Directories affected (3):
-    /home/data/plex/data/media/movies
-    /home/data/plex/data/media/tv/Breaking Bad
-    /home/data/plex/data/media/tv/The Office
+    /home/data/plex/media/movies
+    /home/data/plex/media/tv/Breaking Bad
+    /home/data/plex/media/tv/The Office
 ```
 
 > The `-I` interactive confirmation flag is stripped automatically since you already reviewed the file.
 > Space freed is computed from targets that were actually confirmed removed — if any operations failed,
-> they will appear in the Errors section and are excluded from the total.
+> they will appear in an Errors section and are excluded from the total.
 
-### Running scripts manually
+If your SSH user doesn't own the files (e.g. owned by the torrent client), set `"ssh.sudo": true` in config. You'll be prompted for the sudo password before connecting.
+
+### Run scripts manually
 
 As an alternative to `--apply`, copy the script to your server and run it there:
 
@@ -173,14 +200,14 @@ bash ~/plex_purge_candidates_<timestamp>.sh
 
 ## Output
 
-All output files are written to `output_dir` (default: `./reports`).
+All output files are written to `output_dir` (default: `./reports`). Each scan keeps the **5 most recent** report/script pairs per type and prunes older ones automatically.
 
 ### Duplicate scan
 
 | File | Description |
 |---|---|
 | `plex_duplicate_report_<timestamp>.md` | Grouped table of duplicates with KEEP / PURGE? labels and sizes |
-| `plex_purge_candidates_<timestamp>.sh` | Shell script using `rm -Iv` (interactive) — run on the Plex server |
+| `plex_purge_candidates_<timestamp>.sh` | Shell script using `rm -Iv` (interactive) |
 
 Files within each duplicate group are ranked by your `prefer` settings. The highest-scoring file is marked KEEP; the rest are marked PURGE?. Review the report before running the script.
 
@@ -189,24 +216,29 @@ Files within each duplicate group are ranked by your `prefer` settings. The high
 | File | Description |
 |---|---|
 | `plex_torrent_cleanup_<timestamp>.md` | Report listing matched, alternate, and orphan torrent entries |
-| `plex_torrent_cleanup_<timestamp>.sh` | Shell script for cleanup — run on the Plex server |
+| `plex_torrent_cleanup_<timestamp>.sh` | Shell script for cleanup |
 
 Torrents are classified into three tiers:
 
 | Tier | Meaning | Script action |
 |---|---|---|
 | **Exact match** | Torrent name closely matches a Plex file | `rm -rIv` (interactive per item) |
-| **Plex has alternate** | Title exists in Plex under a different edition/quality | `rm -rf` (direct delete) |
-| **True orphan** | No version of this title in Plex | `mv`/`# rm` pair — comment out the one you don't want |
+| **Plex has alternate** | Title exists in Plex under a different edition/quality | `rm -rfv` (direct delete, verbose) |
+| **True orphan** | No version of this title found in Plex | `mv -v` / `# rm -rfv` pair — keep the action you want, comment out the other |
 
 True orphan entries look like this in the script:
 
 ```bash
 mv -v -- '/path/to/orphan' '/path/to/staging/'
-# rm -rf -- '/path/to/orphan'
+# rm -rfv -- '/path/to/orphan'
 ```
 
-Comment out the `mv` line to delete instead, or comment out the `rm` line to move.
+Comment out the `mv` line to delete instead, or comment out the `rm` line to move to staging.
+
+> **Note on large moves:** If `torrent_orphan_move_dest` is on a different filesystem than your
+> torrent directories, `mv` has to copy every byte before deleting the original. Moving hundreds
+> of GBs will be slow. Point the destination to the same filesystem (or the same drive) for
+> instant renames.
 
 ### Junk file scan (when `scan_junk: true`)
 
@@ -223,8 +255,4 @@ Files are classified into three categories:
 | **Sample files** | Video files with `sample` in the name | Preview clips bundled with releases |
 | **Extras / bonus content** | Files inside `Featurettes/`, `Behind the Scenes/`, `Trailers/`, etc. | Plex Pass users can browse these — only delete if you don't need them |
 
-Set `keep_local_artwork: true` (the default) to preserve `poster.jpg`, `fanart.jpg`, and other Plex local media assets from being flagged as junk.
-
-### Report retention
-
-Each scan keeps the **5 most recent** report/script pairs per type and deletes older ones automatically. Change the `keep` value in `prune_old_reports()` in `plex_dupe_scan.py` if you want to retain more.
+`keep_local_artwork: true` (the default) preserves `poster.jpg`, `fanart.jpg`, and other Plex local media assets so they aren't flagged as junk.
