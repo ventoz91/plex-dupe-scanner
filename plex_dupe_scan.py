@@ -3,6 +3,7 @@
 import argparse
 import getpass
 import json
+import math
 import os
 import re
 import shlex
@@ -389,10 +390,12 @@ def score_file(item: dict, prefer: dict) -> int:
     if codec in codec_order:
         score += (len(codec_order) - codec_order.index(codec)) * 100
 
-    # TODO: The MB-scale bonus can let a very large lower-res file outscore a smaller
-    # higher-res one (e.g. 50 GB 720p vs 2 GB 1080p). Consider log-scaling or capping.
+    # Log-scale the size bonus so it acts as a tiebreaker within a quality tier
+    # rather than overriding it. 50 GB adds ~780 pts vs 1 GB adding ~550 pts —
+    # always less than one resolution step (1000 pts).
     if prefer.get("prefer_larger_file", True):
-        score += int(item["size"] / 1024 / 1024)
+        size_mb = item["size"] / 1024 / 1024
+        score += int(math.log2(max(size_mb, 1)) * 50)
 
     return score
 
@@ -874,10 +877,27 @@ def main() -> None:
         action="store_true",
         help="Print duplicate/torrent stats without writing any report files.",
     )
+    parser.add_argument(
+        "--review",
+        action="store_true",
+        help="Open the most recent generated script(s) in your editor (config: editor, default: vim).",
+    )
 
     args = parser.parse_args()
     config = load_config(args.config)
     validate_config(config)
+
+    if args.review:
+        editor = config.get("editor", "vim")
+        output_dir = Path(config.get("output_dir", "./reports"))
+        scripts: list[str] = []
+        for pattern in ["plex_purge_candidates_*.sh", "plex_torrent_cleanup_*.sh"]:
+            matches = sorted(output_dir.glob(pattern), reverse=True)
+            if matches:
+                scripts.append(str(matches[0]))
+        if not scripts:
+            sys.exit(f"No scripts found in {output_dir}")
+        os.execvp(editor, [editor] + scripts)
 
     if args.apply:
         apply_script(config, args.apply)
