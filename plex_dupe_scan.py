@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import sys
+import threading
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -1009,39 +1010,57 @@ def apply_script(config: dict, script_path_str: str) -> None:
         stdin.write(exec_script)
         stdin.channel.shutdown_write()
 
-        out_text = stdout.read().decode("utf-8", errors="replace")
-        err_text = stderr_ch.read().decode("utf-8", errors="replace")
-        exit_code = stdout.channel.recv_exit_status()
+        # Drain stderr in a background thread so it never fills up and deadlocks
+        # the remote process while we stream stdout line by line.
+        err_raw: list[str] = []
 
-        # Count removed/moved items from verbose output
+        def _drain_stderr() -> None:
+            for raw in stderr_ch:
+                err_raw.append(raw.rstrip("\n\r"))
+
+        t_err = threading.Thread(target=_drain_stderr, daemon=True)
+        t_err.start()
+
+        # Stream stdout as it arrives — shows progress and avoids buffering the
+        # entire output of a large deletion into memory before parsing.
         files_removed = 0
         dirs_removed = 0
         top_level_done: set[str] = set()
         moved_count = 0
 
-        for line in out_text.splitlines():
+        print("── Output " + "─" * 47)
+        for raw_line in stdout:
+            line = raw_line.rstrip("\n\r")
             m = re.match(r"removed directory '(.+)'$", line)
             if m:
                 dirs_removed += 1
                 if m.group(1) in target_paths:
                     top_level_done.add(m.group(1))
+                print(f"  {line}")
                 continue
             m = re.match(r"removed '(.+)'$", line)
             if m:
                 files_removed += 1
                 if m.group(1) in target_paths:
                     top_level_done.add(m.group(1))
+                print(f"  {line}")
                 continue
             if " -> " in line:
                 moved_count += 1
-                # mv -v: '/src' -> '/dest'
                 mv_m = re.match(r"'(.+)' -> ", line)
                 if mv_m and mv_m.group(1) in target_paths:
                     top_level_done.add(mv_m.group(1))
+                print(f"  {line}")
+                continue
+            if line:
+                print(f"  {line}")
+
+        t_err.join()
+        exit_code = stdout.channel.recv_exit_status()
 
         # Filter out the sudo password prompt that lands on stderr
         err_lines = [
-            l for l in err_text.splitlines()
+            l for l in err_raw
             if l.strip() and not re.match(r"^\[sudo\] password", l)
         ]
 
