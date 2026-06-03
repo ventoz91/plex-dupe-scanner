@@ -222,7 +222,7 @@ def run_remote_junk_scan(client: paramiko.SSHClient, config: dict) -> list[dict]
         "    for root,dirs,files in os.walk(rp):\n"
         "        for name in files:\n"
         "            ext=os.path.splitext(name)[1].lower()\n"
-        "            if ext in always_keep:continue\n"
+        "            if ext in always_keep or name.lower() in always_keep:continue\n"
         "            is_vid=ext in video_exts\n"
         "            is_broad=ext in broad_vid_exts\n"
         "            is_sub=ext in sub_exts\n"
